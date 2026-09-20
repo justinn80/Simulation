@@ -173,15 +173,15 @@ class Gatherer:
     def calculate_fitness(self):
         survival_score = self.age / 100.0  
         food_score = self.food_collected * 3
-        if self_age > 0:
+        if self.age > 0:
             efficency_score = (self.food_colelcted / self.age) * 60
         else:
             efficency_score = 0
         energy_score = self.energy * 2
         cooperation_score = self.genes['cooperation'] * 5
         caution_penalty = 0
-        if self.genes['caution'] > 0.3 and self.food_collected < 8:
-            caution_penalty = 15.0
+        if self.genes['caution'] > 0.5 and self.food_collected < 10:
+            caution_penalty = 10.0
         death_penalty = 0
         if not self.alive:
             death_penalty = 20.0
