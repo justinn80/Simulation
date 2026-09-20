@@ -27,33 +27,15 @@ class GeneticAlgorithm:
         return fitness_scores
     
     def select_survivors(self, fitness_scores):
-        # STUDENT ASSIGNMENT 3: Implement a better selection mechanism
-        # Current version just takes top 50% - very simple!
-        #
-        # Available information:
-        # - fitness_scores: list of (gatherer, fitness) tuples, sorted by fitness (best first)
-        # - SURVIVAL_RATE: currently 0.05 (top 5% survive)
-        # - len(fitness_scores): total population size
-        #
-        # Alternative selection strategies to consider:
-        # 1. Tournament selection: pick random groups, take best from each
-        # 2. Roulette wheel: probability proportional to fitness
-        # 3. Rank-based: select based on rank, not raw fitness values
-        # 4. Elite + random: guarantee best survive, then random selection
-        # 5. Fitness-proportionate with scaling (linear/exponential)
-        # 6. Hybrid approaches: combine multiple strategies
-        #
-        # Strategy hints:
-        # - Pure elitism (current) can cause premature convergence
-        # - Pure randomness loses good solutions
-        # - Tournament selection often works well (simple + effective)
-        # - Consider selection pressure: too high = less diversity, too low = slow evolution
-        #
-        # Remember: Selection determines which traits get passed to next generation!
-        
         # Minimal version: just take top 50% of population
-        survival_count = max(1, len(fitness_scores) // 2)  # Top 50%
-        survivors = [gatherer for gatherer, fitness in fitness_scores[:survival_count]]
+        amount_alive = max(1, len(fitness_scores) // 2)  # Top 50%
+        survivors = [fitness_scores[0][0]]
+        while len(survivors) < amount_alive:
+            remaining_life = min(3,len(fitness_scores))
+            tournament = random.sample(fitness_scores, reamining_life)
+            champion = max(tournament, key=lambda x: x[1])[0]
+            if champion not in survivors:
+                survivors.append(champion)
         return survivors
     
     def crossover(self, parent1, parent2):
@@ -73,11 +55,11 @@ class GeneticAlgorithm:
             if random.random() < MUTATION_RATE:
                 # Minimal version: just flip a coin and randomize the gene completely
                 min_val, max_val = GENE_RANGES[gene_name]
-                current_value = gatherer.genes[gene_name]
+                current_val = gatherer.genes[gene_name]
                 change = random.gauss(0, MUTATION_STRENGTH)
-                new_value = current_value + change
-                new_value = max(min_val, min(max_val, new_value))
-                gatherer.genes[gene_name] = new_value
+                new_val = current_val + change
+                new_val = max(min_val, min(max_val, new_val))
+                gatherer.genes[gene_name] = new_val
     
     def create_next_generation(self, population):
         # Evaluate fitness
