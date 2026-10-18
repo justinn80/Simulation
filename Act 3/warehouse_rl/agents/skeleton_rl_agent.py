@@ -113,27 +113,80 @@ class SkeletonOptimizationAgent(BaselineAgent):
         return 0  # No action
     
     def _get_naive_layout_action(self, current_timestep) -> list:
-        """
-        WEEK 1 STEP 1: Layout optimization - students should improve this!
-        
-        Current problems:
-        - Random swaps with no strategic purpose
-        - Ignores item co-occurrence patterns
-        - No consideration of delivery distances
-        - Wastes manager time on pointless moves
-        """
-        
-        # TODO WEEK 1 STEP 1: Students should implement intelligent layout optimization
-        # Current approach: Occasionally make random swaps
-        
-        if current_timestep % 100 == 0 and np.random.random() < 0.2:  # Random timing
-            # Pick two random positions to swap
-            grid_size = self.env.grid_width * self.env.grid_height
-            pos1 = np.random.randint(0, grid_size)
-            pos2 = np.random.randint(0, grid_size)
-            return [pos1, pos2]
-        
-        return [0, 0]  # No swap
+    """
+    Layout optimization: greedy best swap that minimizes
+        sum_{i<j} C[i,j] * dist(pos_i, pos_j)  +  sum_i F[i] * dist(pos_i, depot)
+    where C = decayed item co-occurrence and F = decayed item demand.
+    Evaluates all cell-pair swaps in one vectorized pass.
+    Checks worth of each swap considered.
+    """
+    NO_OP = [0, 0]
+    CHECK_EVERY, COOLDOWN = 25, 100
+    DECAY, MIN_REL_GAIN = 0.98, 0.02
+
+    env = self.env
+    W, H = env.grid_width, env.grid_height
+    n_cells = W * H
+
+    # one-time setup (cached) 
+    if not hasattr(self, "_lay"):
+        xs, ys = np.divmod(np.arange(n_cells), W)[::-1]  # x = idx % W, y = idx // W
+        coords = np.stack([xs, ys], axis=1)
+        D = np.abs(coords[:, None, :] - coords[None, :, :]).sum(-1).astype(float)  
+        dx, dy = getattr(env, "delivery_point", (0, 0))
+        Dd = np.abs(xs - dx) + np.abs(ys - dy)
+        n_items = env.num_items
+        self._lay = dict(D=D, Dd=Dd.astype(float),
+                         C=np.zeros((n_items, n_items)), F=np.zeros(n_items),
+                         last_swap=-COOLDOWN)
+
+    s = self._lay
+    C, F, D, Dd = s["C"], s["F"], s["D"], s["Dd"]
+
+    # incremental demand statistics 
+    # HOOK: adapt to however your env exposes new orders (list of item-id lists)
+    new_orders = self._get_orders_since_last_call()
+    if new_orders:
+        C *= DECAY
+        F *= DECAY
+        for order in new_orders:
+            items = np.unique(order)
+            F[items] += 1.0
+            if len(items) > 1:
+                C[np.ix_(items, items)] += 1.0
+        np.fill_diagonal(C, 0.0)
+
+    # throttle
+    if current_timestep % CHECK_EVERY or current_timestep - s["last_swap"] < COOLDOWN:
+        return NO_OP
+    if F.sum() == 0:
+        return NO_OP
+
+    # build cell-level weights 
+    layout = np.asarray(env.layout).ravel()
+    occupied = layout >= 0
+    ids = np.where(occupied, layout, 0)
+
+    Fc = np.where(occupied, F[ids], 0.0)                              
+    Cc = C[np.ix_(ids, ids)] * np.outer(occupied, occupied)          
+
+    G = Cc @ D + np.outer(Fc, Dd)
+    own = np.diag(G)
+
+    delta = G + G.T - own[:, None] - own[None, :] + 2.0 * Cc * D
+    np.fill_diagonal(delta, 0.0)
+    delta[np.triu_indices(n_cells)] = 0.0          # each unordered pair once
+
+    # pick best swap, only if worth it 
+    flat = int(np.argmin(delta))
+    a, b = divmod(flat, n_cells)
+    gain = -delta[a, b]
+    total_cost = 0.5 * own.sum()                    
+    if gain <= MIN_REL_GAIN * max(total_cost, 1e-9) or (not occupied[a] and not occupied[b]):
+        return NO_OP
+
+    s["last_swap"] = current_timestep
+    return [int(a), int(b)]
     
     def _get_naive_order_assignments(self, queue_info, employee_info) -> list:
         """
@@ -245,14 +298,141 @@ class StudentOptimizationAgent(SkeletonOptimizationAgent):
         pass
     
     def _get_improved_layout_action(self, observation):
-        """
-        WEEK 1 STEP 1: Students implement smart layout optimization:
-        - Move frequently accessed items closer to delivery
-        - Group items that are often ordered together
-        - Only optimize when queue is manageable
-        - Track swap effectiveness
-        """
-        pass
+    """
+    Smart layout optimization. Greedy best-swap on
+        cost = sum_{i<j} C[i,j]*dist(i,j) + sum_i F[i]*dist(i, delivery)
+    with C = decayed co-occurrence, F = decayed demand.
+    Gated by queue size, cooldown, and an adaptive threshold that learns
+    from how well past swaps actually worked.
+    """
+    from collections import deque
+
+    NO_OP = [0, 0]
+    CHECK_EVERY, COOLDOWN = 20, 80
+    MAX_QUEUE = 8                 
+    DECAY = 0.98
+    EVAL_WINDOW = 60             
+    TABU_STEPS = 300              
+    GAIN_MIN, GAIN_MAX = 0.005, 0.10
+
+    env = self.env
+    W, H = env.grid_width, env.grid_height
+    n_cells = W * H
+
+    #  one-time setup 
+    if not hasattr(self, "_il"):
+        idx = np.arange(n_cells)
+        xs, ys = idx % W, idx // W
+        coords = np.stack([xs, ys], axis=1)
+        D = np.abs(coords[:, None, :] - coords[None, :, :]).sum(-1).astype(float)
+        dx, dy = getattr(env, "delivery_point", (0, 0))
+        Dd = (np.abs(xs - dx) + np.abs(ys - dy)).astype(float)
+        n_items = env.num_items
+        self._il = dict(
+            D=D, Dd=Dd, t=0,
+            C=np.zeros((n_items, n_items)), F=np.zeros(n_items),
+            metric=deque(maxlen=400),            
+            last_swap_t=-COOLDOWN,
+            pending=None,                       
+            tabu={},                             
+            min_gain=0.02,
+            history=[],                          
+        )
+    s = self._il
+    s["t"] += 1
+    t = s["t"]
+    C, F, D, Dd = s["C"], s["F"], s["D"], s["Dd"]
+
+    queue_len, new_orders, metric = self._parse_layout_observation(observation)
+
+    # update demand statistics 
+    if new_orders:
+        C *= DECAY
+        F *= DECAY
+        for order in new_orders:
+            items = np.unique(order)
+            F[items] += 1.0
+            if len(items) > 1:
+                C[np.ix_(items, items)] += 1.0
+        np.fill_diagonal(C, 0.0)
+
+    if metric is not None:
+        s["metric"].append((t, float(metric)))
+
+    # evaluate the last swap's effectiveness 
+    p = s["pending"]
+    if p is not None and t - p["t"] >= EVAL_WINDOW and metric is not None:
+        before = [v for (tt, v) in s["metric"] if p["t"] - EVAL_WINDOW <= tt < p["t"]]
+        after = [v for (tt, v) in s["metric"] if tt >= p["t"]]
+        if before and after:
+            b, a = np.mean(before), np.mean(after)
+            realized = (b - a) / max(abs(b), 1e-9)       
+            s["history"].append((p["t"], p["gain"], realized))
+            # adapt aggressiveness: effective -> lower threshold, harmful -> raise it
+            s["min_gain"] = float(np.clip(
+                s["min_gain"] * (0.85 if realized > 0 else 1.4), GAIN_MIN, GAIN_MAX))
+        s["pending"] = None
+    elif p is not None and t - p["t"] >= EVAL_WINDOW:
+        s["pending"] = None                              
+
+    # gating 
+    if (t % CHECK_EVERY or t - s["last_swap_t"] < COOLDOWN
+            or queue_len > MAX_QUEUE or F.sum() == 0):
+        return NO_OP
+
+    # cell-level weights 
+    layout = np.asarray(env.layout).ravel()
+    occ = layout >= 0
+    ids = np.where(occ, layout, 0)
+    Fc = np.where(occ, F[ids], 0.0)
+    Cc = C[np.ix_(ids, ids)] * np.outer(occ, occ)
+
+    # G[a, q]: cost of the entity at cell a if it were relocated to cell q
+    G = Cc @ D + np.outer(Fc, Dd)
+    own = np.diag(G)
+
+    # exact total cost change for swapping cells a and b (vectorized over all pairs)
+    delta = G + G.T - own[:, None] - own[None, :] + 2.0 * Cc * D
+    delta = np.triu(delta, 1)                            
+
+    # block recently-made swaps (tabu)
+    for key in [k for k, exp in s["tabu"].items() if exp <= t]:
+        del s["tabu"][key]
+    for key in s["tabu"]:
+        a_, b_ = sorted(key)
+        delta[a_, b_] = 0.0
+
+    # pick best swap if it clears the adaptive threshold 
+    a, b = divmod(int(np.argmin(delta)), n_cells)
+    gain = -delta[a, b]
+    total_cost = 0.5 * float((Cc * D).sum()) + float((Fc * Dd).sum())
+    if gain <= s["min_gain"] * max(total_cost, 1e-9) or not (occ[a] or occ[b]):
+        return NO_OP
+
+    s["last_swap_t"] = t
+    s["pending"] = dict(t=t, gain=gain / max(total_cost, 1e-9))
+    s["tabu"][frozenset((a, b))] = t + TABU_STEPS
+    return [int(a), int(b)]
+
+    def _parse_layout_observation(self, observation):
+    """
+    HOOK: return (queue_length, new_orders, performance_metric).
+      new_orders: list of item-id lists completed/received since last call
+      performance_metric: lower-is-better scalar (e.g. avg fulfilment time) or None
+    """
+    env = self.env
+    if isinstance(observation, dict):
+        queue_len = int(observation.get("queue_length",
+                        np.sum(np.asarray(observation.get("queue_info", [[0]]))[:, 0] > 0)))
+        metric = observation.get("avg_fulfillment_time")
+    else:
+        queue_len = int(getattr(env, "queue_length", 0))
+        metric = getattr(env, "avg_fulfillment_time", None)
+
+    orders = getattr(env, "completed_orders", [])
+    start = getattr(self, "_orders_seen", 0)
+    self._orders_seen = len(orders)
+    return queue_len, orders[start:], metric
     
     def _get_improved_order_assignments(self, queue_info, employee_info):
         """
