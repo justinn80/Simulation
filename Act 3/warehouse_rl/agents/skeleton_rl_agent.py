@@ -81,36 +81,74 @@ class SkeletonOptimizationAgent(BaselineAgent):
         return action
     
     def _get_naive_staffing_action(self, financial_state, employee_info) -> int:
-        """
-        WEEK 2 STEP 1: Staffing decisions - students should improve this!
-        
-        Current problems:
-        - Ignores queue length and workload
-        - Random decisions regardless of profit
-        - No consideration of employee efficiency
-        """
-        
-        # TODO WEEK 2 STEP 1: Students should implement intelligent staffing logic
-        # Current approach: Make random decisions based on "vibes"
-        
-        current_profit = financial_state[0]
-        num_employees = np.sum(employee_info[:, 0] > 0)  # Count active employees
-        
-        # Terrible logic: Random decisions with slight bias
-        # BUT: Hire managers more frequently so layout optimization can work
-        has_manager = np.any(employee_info[:, 5] == 1)  # Check if we have a manager
-        
-        if np.random.random() < 0.3:  # 30% chance to hire
-            if num_employees < 20:  # Don't go completely overboard
-                return 1  # Hire worker
-        elif np.random.random() < 0.1:  # 10% chance to fire
-            if num_employees > 1:  # Don't fire everyone
-                return 2  # Fire worker
-        elif np.random.random() < 0.2:  # 20% chance to hire manager (increased from 5%)
-            if not has_manager or num_employees > 10:  # Hire manager if we don't have one, or if we have lots of workers
-                return 3  # Hire manager
-        
-        return 0  # No action
+    """
+    Workload- and profit-aware staffing with hysteresis and cooldown.
+    Returns 0 = none, 1 = hire worker, 2 = fire worker, 3 = hire manager.
+    """
+    # tunables 
+    MAX_STAFF, MIN_WORKERS = 20, 1
+    WORKERS_PER_MANAGER = 8
+    COOLDOWN = 15
+    EMA = 0.1
+    HIRE_QPW, FIRE_QPW = 2.0, 0.5       # queued orders per worker thresholds
+    HIRE_UTIL, FIRE_UTIL = 0.85, 0.40   # busy fraction thresholds
+    E_EXISTS, E_BUSY, E_MANAGER = 0, 3, 5
+
+    # ---- state ----
+    if not hasattr(self, "_staff"):
+        self._staff = dict(t=0, last=-COOLDOWN, profit_ema=None, trend=0.0)
+    s = self._staff
+    s["t"] += 1
+
+    profit = float(financial_state[0])
+    prev = s["profit_ema"]
+    s["profit_ema"] = profit if prev is None else prev + EMA * (profit - prev)
+    s["trend"] = 0.0 if prev is None else (1 - EMA) * s["trend"] + EMA * (s["profit_ema"] - prev)
+
+    if s["t"] - s["last"] < COOLDOWN:
+        return 0
+
+    # workforce snapshot (vectorized) 
+    active = employee_info[:, E_EXISTS] > 0
+    is_mgr = active & (employee_info[:, E_MANAGER] == 1)
+    n_total = int(active.sum())
+    n_mgr = int(is_mgr.sum())
+    n_workers = n_total - n_mgr
+    busy = active & ~is_mgr & (employee_info[:, E_BUSY] > 0)
+    util = busy.sum() / n_workers if n_workers > 0 else 1.0
+    queue = self._get_staffing_queue_length()           # HOOK
+    qpw = queue / max(n_workers, 1) if queue is not None else (util * HIRE_QPW)
+
+    healthy = s["profit_ema"] >= 0 or s["trend"] > 0
+    losing_badly = s["profit_ema"] < 0 and s["trend"] < 0
+
+    action = 0
+    if n_workers < MIN_WORKERS and n_total < MAX_STAFF:
+        action = 1                                       # never runs with no workers
+    elif n_mgr == 0 and healthy and n_total < MAX_STAFF:
+        action = 3                                       # needs a manager for layout
+    elif n_total < MAX_STAFF and (qpw > HIRE_QPW or util > HIRE_UTIL):
+        # hire into demand if profit is falling, only for a severe backlog
+        if not losing_badly or qpw > 2 * HIRE_QPW:
+            needs_mgr = n_workers >= WORKERS_PER_MANAGER * (n_mgr + 1) and healthy
+            action = 3 if needs_mgr else 1
+    elif n_workers > MIN_WORKERS and qpw < FIRE_QPW and util < FIRE_UTIL:
+        action = 2                                       # idle capacity is pure cost
+    elif n_workers > MIN_WORKERS and losing_badly and util < HIRE_UTIL:
+        action = 2                                       # shrink to stop the bleeding
+
+    if action:
+        s["last"] = s["t"]
+    return action
+
+    def _get_staffing_queue_length(self):
+    """return the current order queue length, or None if unavailable."""
+    q = getattr(self.env, "queue_length", None)
+    if q is None:
+        qi = getattr(self.env, "queue_info", None)
+        if qi is not None:
+            q = int((np.asarray(qi)[:, 0] > 0).sum())
+    return q
     
     def _get_naive_layout_action(self, current_timestep) -> list:
     """
@@ -144,7 +182,6 @@ class SkeletonOptimizationAgent(BaselineAgent):
     C, F, D, Dd = s["C"], s["F"], s["D"], s["Dd"]
 
     # incremental demand statistics 
-    # HOOK: adapt to however your env exposes new orders (list of item-id lists)
     new_orders = self._get_orders_since_last_call()
     if new_orders:
         C *= DECAY
@@ -162,7 +199,7 @@ class SkeletonOptimizationAgent(BaselineAgent):
     if F.sum() == 0:
         return NO_OP
 
-    # build cell-level weights 
+    # build cell level weights 
     layout = np.asarray(env.layout).ravel()
     occupied = layout >= 0
     ids = np.where(occupied, layout, 0)
@@ -189,31 +226,66 @@ class SkeletonOptimizationAgent(BaselineAgent):
     return [int(a), int(b)]
     
     def _get_naive_order_assignments(self, queue_info, employee_info) -> list:
-        """
-        WEEK 2 STEP 2: Order assignment - students should improve this!
-        
-        Current problems:
-        - Ignores employee locations
-        - No consideration of order priority/value
-        - Random assignments regardless of efficiency
-        - Doesn't check if employees are actually available
-        """
-        
-        # TODO WEEK 2 STEP 2: Students should implement intelligent order assignment
-        # Current approach: Random assignments
-        
-        assignments = [0] * 20  # No assignments by default
-        
-        # Count how many employees we have (very naive)
-        num_employees = int(np.sum(employee_info[:, 0] > 0))
-        
-        # Randomly assign first few orders to first few employees
-        if num_employees > 0:
-            for i in range(min(3, num_employees)):  # Only assign 3 orders max
-                if np.random.random() < 0.6:  # 60% chance to assign
-                    assignments[i] = (i % num_employees) + 1  # Random employee
-        
+    """
+    Optimal order assignment: maximizes sum of
+        value * (1 + urgency) / (1 + distance(employee -> pickup))
+    over all (order, free worker) pairs using the Hungarian algorithm.
+    """
+    # column layout 
+    E_EXISTS, E_X, E_Y, E_BUSY, E_MANAGER = 0, 1, 2, 3, 5
+    Q_EXISTS, Q_X, Q_Y, Q_VALUE, Q_PRIORITY = 0, 1, 2, 3, 4
+    N_SLOTS = 20
+
+    assignments = [0] * N_SLOTS
+
+    queue_info = np.asarray(queue_info, dtype=float)
+    employee_info = np.asarray(employee_info, dtype=float)
+
+    # valid orders and available workers 
+    order_idx = np.flatnonzero(queue_info[:N_SLOTS, Q_EXISTS] > 0)
+    avail = employee_info[:, E_EXISTS] > 0
+    if employee_info.shape[1] > E_BUSY:
+        avail &= employee_info[:, E_BUSY] <= 0
+    if employee_info.shape[1] > E_MANAGER:
+        avail &= employee_info[:, E_MANAGER] != 1      # so managers don't fulfil orders
+    emp_idx = np.flatnonzero(avail)
+
+    if order_idx.size == 0 or emp_idx.size == 0:
         return assignments
+
+    Q = queue_info[order_idx]
+    E = employee_info[emp_idx]
+
+    # order score: value * urgency (degrades gracefully if columns are absent) 
+    ncols = Q.shape[1]
+    value = Q[:, Q_VALUE] if ncols > Q_VALUE else np.ones(len(Q))
+    urgency = 1.0 + (np.maximum(Q[:, Q_PRIORITY], 0.0) if ncols > Q_PRIORITY else 0.0)
+    score = np.maximum(value, 1e-6) * urgency
+
+    # distance matrix (orders x workers), Manhattan 
+    dist = (np.abs(Q[:, None, Q_X] - E[None, :, E_X]) +
+            np.abs(Q[:, None, Q_Y] - E[None, :, E_Y]))
+
+    benefit = score[:, None] / (1.0 + dist)
+
+    # optimal matching (rectangular is fine) 
+    try:
+        from scipy.optimize import linear_sum_assignment
+        rows, cols = linear_sum_assignment(benefit, maximize=True)
+    except ImportError:
+        # greedy fallback: repeatedly take the best remaining pair
+        b = benefit.copy()
+        rows, cols = [], []
+        for _ in range(min(b.shape)):
+            r, c = np.unravel_index(np.argmax(b), b.shape)
+            rows.append(r); cols.append(c)
+            b[r, :] = -np.inf
+            b[:, c] = -np.inf
+
+    for r, c in zip(rows, cols):
+        assignments[int(order_idx[r])] = int(emp_idx[c]) + 1   # 1-based employee id
+
+    return assignments
     
     def record_reward(self, reward: float):
         """
@@ -288,14 +360,74 @@ class StudentOptimizationAgent(SkeletonOptimizationAgent):
         # self.target_network = None
         
     def _get_improved_staffing_action(self, financial_state, employee_info, queue_info):
-        """
-        WEEK 2 STEP 1: Students implement intelligent staffing:
-        - Hire when queue is growing
-        - Fire when queue is empty for extended periods
-        - Consider profit margins before hiring
-        - Balance managers vs workers
-        """
-        pass
+    """
+    Queue-trend, profit, and manager-ratio aware staffing.
+    Returns 0 = none, 1 = hire worker, 2 = fire worker, 3 = hire manager.
+    """
+    # ---- tunables ----
+    MAX_STAFF, MIN_WORKERS = 20, 1
+    WORKERS_PER_MANAGER = 8
+    COOLDOWN = 15
+    FAST, SLOW, PROFIT_EMA = 0.3, 0.05, 0.1
+    HIRE_QPW, SEVERE_QPW = 1.5, 4.0       # queued orders per worker
+    GROWTH_MARGIN = 0.5                   # fast avg must exceed slow avg by this
+    EMPTY_STEPS = 40                      # empty-queue streak before firing
+    MIN_PROFIT = 0.0                      # smoothed profit required to hire
+    E_EXISTS, E_BUSY, E_MANAGER = 0, 3, 5
+
+    # ---- state ----
+    if not hasattr(self, "_staff2"):
+        self._staff2 = dict(t=0, last=-COOLDOWN, q_fast=0.0, q_slow=0.0,
+                            empty=0, profit=None, trend=0.0)
+    s = self._staff2
+    s["t"] += 1
+
+    # ---- queue statistics ----
+    queue = int((np.asarray(queue_info)[:, 0] > 0).sum())
+    s["q_fast"] += FAST * (queue - s["q_fast"])
+    s["q_slow"] += SLOW * (queue - s["q_slow"])
+    s["empty"] = s["empty"] + 1 if queue == 0 else 0
+    growing = s["q_fast"] > s["q_slow"] + GROWTH_MARGIN
+
+    # ---- profit statistics ----
+    profit = float(financial_state[0])
+    prev = s["profit"]
+    s["profit"] = profit if prev is None else prev + PROFIT_EMA * (profit - prev)
+    s["trend"] = 0.0 if prev is None else (1 - PROFIT_EMA) * s["trend"] + PROFIT_EMA * (s["profit"] - prev)
+    can_afford = s["profit"] >= MIN_PROFIT
+    losing = s["profit"] < 0 and s["trend"] < 0
+
+    if s["t"] - s["last"] < COOLDOWN:
+        return 0
+
+    # ---- workforce snapshot (vectorized)
+    active = employee_info[:, E_EXISTS] > 0
+    is_mgr = active & (employee_info[:, E_MANAGER] == 1)
+    n_total = int(active.sum())
+    n_mgr = int(is_mgr.sum())
+    n_workers = n_total - n_mgr
+    n_busy = int((active & ~is_mgr & (employee_info[:, E_BUSY] > 0)).sum())
+    n_idle = n_workers - n_busy
+    qpw = queue / max(n_workers, 1)
+    target_mgr = max(1, -(-n_workers // WORKERS_PER_MANAGER))   # ceil division
+    room = n_total < MAX_STAFF
+
+    action = 0
+    if n_workers < MIN_WORKERS and room:
+        action = 1                                               # never run with no workers
+    elif n_mgr == 0 and can_afford and room:
+        action = 3                                               # need a manager for layout
+    elif room and n_idle < queue and (
+            (growing and qpw > HIRE_QPW and can_afford)
+            or (qpw > SEVERE_QPW and not losing)):
+        action = 3 if n_mgr < target_mgr and can_afford else 1   # hire into demand
+    elif n_workers > MIN_WORKERS and s["empty"] >= (EMPTY_STEPS // 2 if losing else EMPTY_STEPS):
+        action = 2                                               # idle capacity is pure cost
+
+    if action:
+        s["last"] = s["t"]
+        s["empty"] = 0 if action == 2 else s["empty"]            # re-earn the next firing
+    return action
     
     def _get_improved_layout_action(self, observation):
     """
@@ -435,14 +567,80 @@ class StudentOptimizationAgent(SkeletonOptimizationAgent):
     return queue_len, orders[start:], metric
     
     def _get_improved_order_assignments(self, queue_info, employee_info):
-        """
-        WEEK 2 STEP 2: Students implement efficient order assignment:
-        - Assign orders to closest available employees
-        - Prioritize high-value or urgent orders
-        - Consider employee current locations
-        - Balance workload across employees
-        """
-        pass
+    """
+    Optimal, workload-balanced order assignment. Maximizes
+        value * (1 + urgency)^2 / (1 + dist(worker -> pickup)) / (1 + BALANCE * load[worker])
+    over all (order, available worker) pairs via the Hungarian algorithm.
+    """
+    # column layout 
+    E_EXISTS, E_X, E_Y, E_BUSY, E_MANAGER = 0, 1, 2, 3, 5
+    Q_EXISTS, Q_X, Q_Y, Q_VALUE, Q_PRIORITY = 0, 1, 2, 3, 4
+    N_SLOTS = 20
+    URGENCY_POWER = 2.0     # higher = urgent orders dominate more
+    BALANCE = 0.3           # higher = spread work more evenly
+    LOAD_DECAY = 0.95       # per-call decay of the assignment counter
+
+    assignments = [0] * N_SLOTS
+
+    queue_info = np.asarray(queue_info, dtype=float)
+    employee_info = np.asarray(employee_info, dtype=float)
+    n_emp = employee_info.shape[0]
+
+    # workload tracker (resized if the workforce changes) 
+    load = getattr(self, "_assign_load", None)
+    if load is None or load.shape[0] != n_emp:
+        load = np.zeros(n_emp)
+    load *= LOAD_DECAY
+
+    # valid orders and available workers 
+    order_idx = np.flatnonzero(queue_info[:N_SLOTS, Q_EXISTS] > 0)
+    avail = employee_info[:, E_EXISTS] > 0
+    if employee_info.shape[1] > E_BUSY:
+        avail &= employee_info[:, E_BUSY] <= 0
+    if employee_info.shape[1] > E_MANAGER:
+        avail &= employee_info[:, E_MANAGER] != 1      # managers don't fulfil orders
+    emp_idx = np.flatnonzero(avail)
+
+    if order_idx.size == 0 or emp_idx.size == 0:
+        self._assign_load = load
+        return assignments
+
+    Q = queue_info[order_idx]
+    E = employee_info[emp_idx]
+
+    # order score: value * urgency (degrades gracefully if columns are absent) 
+    ncols = Q.shape[1]
+    value = np.maximum(Q[:, Q_VALUE], 1e-6) if ncols > Q_VALUE else np.ones(len(Q))
+    urgency = (1.0 + np.maximum(Q[:, Q_PRIORITY], 0.0)) ** URGENCY_POWER if ncols > Q_PRIORITY \
+        else np.ones(len(Q))
+    score = value * urgency
+
+    # benefit matrix (orders x workers) 
+    dist = (np.abs(Q[:, None, Q_X] - E[None, :, E_X]) +
+            np.abs(Q[:, None, Q_Y] - E[None, :, E_Y]))
+    benefit = score[:, None] / (1.0 + dist) / (1.0 + BALANCE * load[emp_idx])[None, :]
+
+    # optimal matching (rectangular is fine) 
+    try:
+        from scipy.optimize import linear_sum_assignment
+        rows, cols = linear_sum_assignment(benefit, maximize=True)
+    except ImportError:
+        # greedy fallback: repeatedly take the best remaining pair
+        b = benefit.copy()
+        rows, cols = [], []
+        for _ in range(min(b.shape)):
+            r, c = np.unravel_index(np.argmax(b), b.shape)
+            rows.append(r); cols.append(c)
+            b[r, :] = -np.inf
+            b[:, c] = -np.inf
+
+    for r, c in zip(rows, cols):
+        e = int(emp_idx[c])
+        assignments[int(order_idx[r])] = e + 1          # 1-based employee id
+        load[e] += 1.0
+
+    self._assign_load = load
+    return assignments
     
     def learn_from_experience(self, state, action, reward, next_state, done):
         """
